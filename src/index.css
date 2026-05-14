@@ -1,0 +1,46 @@
+/* GCC Ops Hub — Global styles */
+/* Design: deep navy dark theme */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  background: #0a0c15;
+  color: #edf0f8;
+}
+
+body {
+  font-family: 'DM Sans', 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0a0c15; }
+::-webkit-scrollbar-thumb { background: #1e2540; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #2e3760; }
+
+/* Form element resets */
+input, textarea, select, button { font-family: inherit; }
+
+/* Dark date picker */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.4);
+  cursor: pointer;
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid #4f80ef66;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+button { transition: opacity 0.12s ease; }
