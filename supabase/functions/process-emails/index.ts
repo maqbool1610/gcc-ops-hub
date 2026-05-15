@@ -96,9 +96,18 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
     .eq('gcc_id', gcc.id)
     .single()
 
-  // 3. Fetch emails (all unread in INBOX, max 50 per run)
+  // 3. Fetch emails (max 50 per run)
   const messages = await fetchGmailMessages(accessToken, syncState?.last_synced_at)
   console.log(`Found ${messages.length} emails to process`)
+
+  // Always update sync state so next run uses a fresh cutoff
+  await supabase
+    .from('email_sync_state')
+    .upsert({
+      gcc_id:         gcc.id,
+      last_synced_at: new Date().toISOString(),
+      last_error:     null,
+    }, { onConflict: 'gcc_id' })
 
   if (!messages.length) {
     return { gcc: gcc.name, processed: 0, groups_updated: 0 }
@@ -167,15 +176,6 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
     }
   }
 
-  // 6. Update sync state
-  await supabase
-    .from('email_sync_state')
-    .upsert({
-      gcc_id:         gcc.id,
-      last_synced_at: new Date().toISOString(),
-      last_error:     null,
-    }, { onConflict: 'gcc_id' })
-
   return { gcc: gcc.name, processed: newMessages.length, groups_updated: groupsUpdated }
 }
 
@@ -205,16 +205,16 @@ async function fetchGmailMessages(token: string, since?: string | null): Promise
     ? Math.floor(new Date(since).getTime() / 1000)
     : Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60  // default: last 7 days
 
-  // No is:unread — deduplication is handled via the email_inbox table.
-  // This ensures emails aren't missed if they were auto-read by another device.
-  const query = `in:inbox after:${afterDate}`
+  // Broad query — no label/read filters, deduplication via email_inbox table.
+  // Avoids missing emails in Promotions, Updates, or auto-read on another device.
+  const query = `after:${afterDate}`
   const url   = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=50`
 
-  console.log(`Gmail query: "${query}" | since: ${since ?? 'none (7d default)'}`)
+  console.log(`Gmail query: "${query}" | since: ${since ?? 'none (7d default)'} | afterDate epoch: ${afterDate}`)
 
   const res  = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
   const data = await res.json()
-  console.log(`Gmail API response: ${data.messages?.length ?? 0} messages, resultSizeEstimate: ${data.resultSizeEstimate}`)
+  console.log(`Gmail raw response: ${JSON.stringify(data).slice(0, 400)}`)
   return data.messages || []
 }
 

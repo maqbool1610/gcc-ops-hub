@@ -89,21 +89,14 @@ export function useEmailInbox(gccId) {
   }
 
   // ── Trigger email sync via Edge Function ────────────────────────────────────
-  // Fire-and-forget: we kick off the function and don't wait for it to finish.
-  // Keeping the connection open would cause EarlyDrop if the function outlasts
-  // the browser's timeout. Instead we poll for new results after a short delay.
   async function triggerSync(gccId) {
     setSyncing(true)
     try {
       const { data: { session } } = await supabase.auth.getSession()
-
-      // Fire the request — intentionally do NOT await the response body.
-      // keepalive: true lets the request survive even if the tab navigates away.
-      fetch(
+      const res = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-emails`,
         {
-          method:    'POST',
-          keepalive: true,
+          method:  'POST',
           headers: {
             'Content-Type':  'application/json',
             'Authorization': `Bearer ${session?.access_token}`,
@@ -111,14 +104,9 @@ export function useEmailInbox(gccId) {
           },
           body: JSON.stringify({ gcc_id: gccId }),
         }
-      ).catch(() => {}) // suppress unhandled rejection
-
-      // Poll for new inbox rows: check at 10s, 25s, 45s, 70s
-      const delays = [10_000, 15_000, 20_000, 25_000]
-      for (const delay of delays) {
-        await new Promise(r => setTimeout(r, delay))
-        await load()
-      }
+      )
+      const result = await res.json()
+      if (result.ok) await load()
     } catch (err) {
       console.error('Sync error:', err.message)
     } finally {
