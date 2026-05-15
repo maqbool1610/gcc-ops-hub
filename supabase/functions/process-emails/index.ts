@@ -205,11 +205,16 @@ async function fetchGmailMessages(token: string, since?: string | null): Promise
     ? Math.floor(new Date(since).getTime() / 1000)
     : Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60  // default: last 7 days
 
-  const query = `is:unread in:inbox after:${afterDate}`
+  // No is:unread — deduplication is handled via the email_inbox table.
+  // This ensures emails aren't missed if they were auto-read by another device.
+  const query = `in:inbox after:${afterDate}`
   const url   = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=50`
+
+  console.log(`Gmail query: "${query}" | since: ${since ?? 'none (7d default)'}`)
 
   const res  = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
   const data = await res.json()
+  console.log(`Gmail API response: ${data.messages?.length ?? 0} messages, resultSizeEstimate: ${data.resultSizeEstimate}`)
   return data.messages || []
 }
 

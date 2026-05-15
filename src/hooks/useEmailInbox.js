@@ -89,34 +89,39 @@ export function useEmailInbox(gccId) {
   }
 
   // ── Trigger email sync via Edge Function ────────────────────────────────────
+  // Fire-and-forget: we kick off the function and don't wait for it to finish.
+  // Keeping the connection open would cause EarlyDrop if the function outlasts
+  // the browser's timeout. Instead we poll for new results after a short delay.
   async function triggerSync(gccId) {
     setSyncing(true)
-    const controller = new AbortController()
-    const timeout    = setTimeout(() => controller.abort(), 30_000) // 30s max
     try {
       const { data: { session } } = await supabase.auth.getSession()
-      const res = await fetch(
+
+      // Fire the request — intentionally do NOT await the response body.
+      // keepalive: true lets the request survive even if the tab navigates away.
+      fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-emails`,
         {
-          method:  'POST',
+          method:    'POST',
+          keepalive: true,
           headers: {
             'Content-Type':  'application/json',
             'Authorization': `Bearer ${session?.access_token}`,
             'apikey':        import.meta.env.VITE_SUPABASE_ANON_KEY,
           },
-          body:   JSON.stringify({ gcc_id: gccId }),
-          signal: controller.signal,
+          body: JSON.stringify({ gcc_id: gccId }),
         }
-      )
-      const result = await res.json()
-      if (result.ok) await load()
-      return result
+      ).catch(() => {}) // suppress unhandled rejection
+
+      // Poll for new inbox rows: check at 10s, 25s, 45s, 70s
+      const delays = [10_000, 15_000, 20_000, 25_000]
+      for (const delay of delays) {
+        await new Promise(r => setTimeout(r, delay))
+        await load()
+      }
     } catch (err) {
-      const msg = err.name === 'AbortError' ? 'Sync timed out — function may still be running' : err.message
-      console.error('Sync error:', msg)
-      return { ok: false, error: msg }
+      console.error('Sync error:', err.message)
     } finally {
-      clearTimeout(timeout)
       setSyncing(false)
     }
   }
