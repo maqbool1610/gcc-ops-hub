@@ -225,22 +225,18 @@ async function getGmailAccessToken(): Promise<string> {
 
 // ── Gmail: list recent unread messages ────────────────────────────────────────
 
-async function fetchGmailMessages(token: string, since?: string | null): Promise<any[]> {
-  // Build query: unread, inbox, after a date if available
-  const afterDate = since
-    ? Math.floor(new Date(since).getTime() / 1000)
-    : Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60  // default: last 7 days
+async function fetchGmailMessages(token: string, _since?: string | null): Promise<any[]> {
+  // Always query the last 7 days. DB deduplication via gmail_id prevents reprocessing.
+  // Using last_synced_at as a cutoff caused missed emails when the cutoff was too recent.
+  const afterDate = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+  const query     = `after:${afterDate}`
+  const url       = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=50`
 
-  // Broad query — no label/read filters, deduplication via email_inbox table.
-  // Avoids missing emails in Promotions, Updates, or auto-read on another device.
-  const query = `after:${afterDate}`
-  const url   = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=50`
-
-  console.log(`Gmail query: "${query}" | since: ${since ?? 'none (7d default)'} | afterDate epoch: ${afterDate}`)
+  console.log(`Gmail query: "${query}"`)
 
   const res  = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
   const data = await res.json()
-  console.log(`Gmail raw response: ${JSON.stringify(data).slice(0, 400)}`)
+  console.log(`Gmail found: ${data.messages?.length ?? 0} messages`)
   return data.messages || []
 }
 
