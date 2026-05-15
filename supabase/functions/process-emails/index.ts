@@ -47,10 +47,36 @@ serve(async (req) => {
     // ── 1. Get GCC config ────────────────────────────────────────────────────
     // Parse gcc_id from request body (if manually triggered) or process all
     let gccId: string | null = null
+    let debug = false
     try {
       const body = await req.json()
       gccId = body?.gcc_id ?? null
+      debug = body?.debug === true
     } catch { /* no body is fine */ }
+
+    // ── DEBUG MODE: test Gmail connection and return raw response ─────────────
+    if (debug) {
+      const accessToken = await getGmailAccessToken()
+      const afterDate   = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+      const query       = `after:${afterDate}`
+      const url         = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=10`
+      const res         = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } })
+      const data        = await res.json()
+
+      // Also fetch labels to confirm auth scope
+      const labelsRes  = await fetch(`${GMAIL_API}/labels`, { headers: { Authorization: `Bearer ${accessToken}` } })
+      const labelsData = await labelsRes.json()
+
+      return new Response(JSON.stringify({
+        debug:        true,
+        gmail_query:  query,
+        messages:     data,
+        labels_count: labelsData.labels?.length ?? 'error',
+        labels_error: labelsData.error ?? null,
+      }, null, 2), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
 
     const { data: gccs, error: gccErr } = await supabase
       .from('gcc')
