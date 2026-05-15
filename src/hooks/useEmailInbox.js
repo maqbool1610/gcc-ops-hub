@@ -34,22 +34,6 @@ export function useEmailInbox(gccId) {
 
   useEffect(() => { load() }, [load])
 
-  // ── Real-time subscription ──────────────────────────────────────────────────
-  useEffect(() => {
-    if (!gccId) return
-    const channel = supabase
-      .channel('email_activity_groups')
-      .on('postgres_changes', {
-        event:  '*',
-        schema: 'public',
-        table:  'email_activity_groups',
-        filter: `gcc_id=eq.${gccId}`,
-      }, () => load())
-      .subscribe()
-
-    return () => supabase.removeChannel(channel)
-  }, [gccId, load])
-
   // ── Confirm: creates an activity from the group ─────────────────────────────
   async function confirm(group, { title, deadline, priority, note } = {}) {
     const vendor = group.vendor
@@ -107,6 +91,8 @@ export function useEmailInbox(gccId) {
   // ── Trigger email sync via Edge Function ────────────────────────────────────
   async function triggerSync(gccId) {
     setSyncing(true)
+    const controller = new AbortController()
+    const timeout    = setTimeout(() => controller.abort(), 30_000) // 30s max
     try {
       const { data: { session } } = await supabase.auth.getSession()
       const res = await fetch(
@@ -118,15 +104,19 @@ export function useEmailInbox(gccId) {
             'Authorization': `Bearer ${session?.access_token}`,
             'apikey':        import.meta.env.VITE_SUPABASE_ANON_KEY,
           },
-          body: JSON.stringify({ gcc_id: gccId }),
+          body:   JSON.stringify({ gcc_id: gccId }),
+          signal: controller.signal,
         }
       )
       const result = await res.json()
       if (result.ok) await load()
       return result
     } catch (err) {
-      return { ok: false, error: err.message }
+      const msg = err.name === 'AbortError' ? 'Sync timed out — function may still be running' : err.message
+      console.error('Sync error:', msg)
+      return { ok: false, error: msg }
     } finally {
+      clearTimeout(timeout)
       setSyncing(false)
     }
   }
