@@ -3,7 +3,7 @@ import { useAuth }             from '../hooks/useAuth'
 import { useVendors }          from '../hooks/useVendors'
 import { useActivities, useAllActivities } from '../hooks/useActivities'
 import { useViewport }         from '../hooks/useViewport'
-import { useEmailInbox }       from '../hooks/useEmailInbox'
+import { useIcebox }           from '../hooks/useIcebox'
 import VendorCard              from '../components/VendorCard'
 import ActivityRow             from '../components/ActivityRow'
 import FilterBar               from '../components/FilterBar'
@@ -11,7 +11,7 @@ import ActivityDetail          from '../components/ActivityDetail'
 import DependencyBanner        from '../components/DependencyBanner'
 import AddActivityForm         from '../components/AddActivityForm'
 import AddVendorForm           from '../components/AddVendorForm'
-import EmailInbox              from '../components/EmailInbox'
+import Icebox                  from '../components/Icebox'
 import { ROLES, VENDOR_COLORS, STATUS } from '../lib/constants'
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
@@ -51,24 +51,16 @@ export default function Dashboard() {
   const [addingSubFor,       setAddingSubFor]       = useState(null)   // activity object
   const [showAddVendor,      setShowAddVendor]      = useState(false)
   const [editingVendor,      setEditingVendor]      = useState(null)
-  const [mobileTab,          setMobileTab]          = useState('home')  // 'home' | 'alerts' | 'activity' | 'inbox'
-  const [showInboxPanel,     setShowInboxPanel]     = useState(false)
+  const [mobileTab,       setMobileTab]       = useState('home') // 'home' | 'activity'
+  const [showIcebox,      setShowIcebox]      = useState(false)
 
   // ── Data ──────────────────────────────────────────────────────────────────
   const { vendors, loading: vendorsLoading, createVendor, updateVendor } = useVendors(gccId)
-  const { activities: allActivities, refetch: refetchAll }                 = useAllActivities(gccId)
-  const {
-    groups:       inboxGroups,
-    loading:      inboxLoading,
-    syncing:      inboxSyncing,
-    pendingCount: inboxCount,
-    confirm:      confirmInboxItem,
-    dismiss:      dismissInboxItem,
-    assignVendor: assignInboxVendor,
-    triggerSync,
-  } = useEmailInbox(gccId)
+  const { activities: allActivities, refetch: refetchAll }               = useAllActivities(gccId)
   const { activities: vendorActivities, createActivity, deleteActivity,
-          updateStatus, updateNote, updateBlocked }                        = useActivities(selectedVendorId)
+          updateStatus, updateNote, updateBlocked }                       = useActivities(selectedVendorId)
+  const { items: iceboxItems, loading: iceboxLoading, count: iceboxCount,
+          assignAndCreate, dismiss: dismissIcebox }                       = useIcebox(gccId)
 
   // Auto-select for vendor role
   useEffect(() => {
@@ -325,31 +317,32 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Centre — Email inbox button (desktop/tablet, GCC Head / HR Head only) */}
-        {!isMobile && (isGccHead || role === 'hr_head') && (
+
+        {/* Icebox button — GCC Head only */}
+        {(isGccHead || role === 'hr_head') && (
           <button
-            onClick={() => setShowInboxPanel(v => !v)}
+            onClick={() => setShowIcebox(v => !v)}
             style={{
-              background:   showInboxPanel ? C.surface3 : C.surface2,
-              border:       `1px solid ${showInboxPanel ? C.accent + '66' : C.border}`,
-              color:        showInboxPanel ? C.text1 : C.text2,
+              background:   showIcebox ? C.surface3 : C.surface2,
+              border:       `1px solid ${showIcebox ? '#fb923c66' : C.border}`,
+              color:        showIcebox ? '#fb923c' : C.text2,
               borderRadius: 20,
               padding:      '4px 12px',
               cursor:       'pointer',
               fontSize:     11,
-              fontWeight:   showInboxPanel ? 600 : 400,
+              fontWeight:   showIcebox ? 600 : 400,
               fontFamily:   'inherit',
               display:      'flex',
               alignItems:   'center',
               gap:          6,
-              transition:   'all 0.12s',
               flexShrink:   0,
+              transition:   'all 0.12s',
             }}
           >
-            ✉ Inbox
-            {inboxCount > 0 && (
-              <span style={{ background: C.accent, color: '#fff', fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 10 }}>
-                {inboxCount}
+            🧊 Icebox
+            {iceboxCount > 0 && (
+              <span style={{ background: '#fb923c', color: '#fff', fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 10 }}>
+                {iceboxCount}
               </span>
             )}
           </button>
@@ -498,21 +491,6 @@ export default function Dashboard() {
                   </>
                 )}
               </>
-            )}
-
-            {/* ── INBOX TAB ────────────────────────────────────────────── */}
-            {mobileTab === 'inbox' && (
-              <EmailInbox
-                groups={inboxGroups}
-                loading={inboxLoading}
-                syncing={inboxSyncing}
-                vendors={vendors}
-                pendingCount={inboxCount}
-                onConfirm={confirmInboxItem}
-                onDismiss={dismissInboxItem}
-                onAssignVendor={assignInboxVendor}
-                onSync={() => triggerSync(gccId)}
-              />
             )}
 
             {/* ── ACTIVITY TAB ─────────────────────────────────────────── */}
@@ -691,33 +669,32 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* ── Email Inbox slide-in panel (desktop/tablet) ───────────── */}
-            {showInboxPanel && !isMobile && (
+            {/* ── Icebox slide-in panel ─────────────────────────────────── */}
+            {showIcebox && (
               <div style={{
-                position:      'absolute',
-                top:           0, right: 0, bottom: 0,
-                width:         'min(420px, 45vw)',
-                background:    C.bg,
-                borderLeft:    `1px solid ${C.border}`,
-                zIndex:        20,
-                display:       'flex',
-                flexDirection: 'column',
-                overflow:      'hidden',
-                boxShadow:     '-8px 0 40px #00000070',
+                position: 'absolute', top: 0, right: 0, bottom: 0,
+                width: 'min(400px, 45vw)',
+                background: C.bg,
+                borderLeft: `1px solid #fb923c33`,
+                zIndex: 20,
+                display: 'flex', flexDirection: 'column',
+                overflow: 'hidden',
+                boxShadow: '-8px 0 40px #00000070',
               }}>
-                <EmailInbox
-                  groups={inboxGroups}
-                  loading={inboxLoading}
-                  syncing={inboxSyncing}
-                  vendors={vendors}
-                  pendingCount={inboxCount}
-                  onConfirm={confirmInboxItem}
-                  onDismiss={dismissInboxItem}
-                  onAssignVendor={assignInboxVendor}
-                  onSync={() => triggerSync(gccId)}
+                <Icebox
+                  items={iceboxItems}
+                  loading={iceboxLoading}
+                  vendors={vendors.filter(v => v.is_active)}
+                  count={iceboxCount}
+                  onAssign={async (item, vendorId) => {
+                    await assignAndCreate(item, vendorId)
+                    refetchAll().catch(() => {})
+                  }}
+                  onDismiss={dismissIcebox}
                 />
               </div>
             )}
+
           </>
         )}
       </div>
@@ -738,7 +715,6 @@ export default function Dashboard() {
           {[
             { id: 'home',     label: 'Home',     icon: '⊞', badge: 0 },
             { id: 'activity', label: 'Activity', icon: '≡', badge: 0 },
-            { id: 'inbox',    label: 'Inbox',    icon: '✉', badge: inboxCount },
           ].map(tab => {
             const active = mobileTab === tab.id
             return (

@@ -2,19 +2,16 @@
 // process-emails — Supabase Edge Function (Deno)
 //
 // Flow:
-//  1. Refresh Gmail access token using stored OAuth refresh token
-//  2. Fetch unread emails since last sync
-//  3. For each email → call Claude to extract operational intelligence
-//  4. Group by (vendor_id, category) — append updates, never duplicate
-//  5. Update sync state
+//  1. Refresh Gmail access token
+//  2. Fetch emails from the last 7 days (dedup via email_inbox table)
+//  3. For each new email → Claude extracts operational intelligence
+//  4. If operational + vendor matched → auto-create or update activity
+//     No user review required. Email is the source of truth.
 //
-// Secrets required (set via: supabase secrets set KEY=value):
-//   GMAIL_CLIENT_ID        — Google OAuth client ID
-//   GMAIL_CLIENT_SECRET    — Google OAuth client secret
-//   GMAIL_REFRESH_TOKEN    — Long-lived refresh token for ops@criticalys.com
-//   ANTHROPIC_API_KEY      — Claude API key
-//   SUPABASE_URL           — auto-provided by Supabase
-//   SUPABASE_SERVICE_ROLE_KEY — auto-provided by Supabase
+// Secrets required:
+//   GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
+//   ANTHROPIC_API_KEY
+//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-provided)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts'
@@ -24,16 +21,14 @@ const GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GMAIL_API       = 'https://gmail.googleapis.com/gmail/v1/users/me'
 const CLAUDE_API      = 'https://api.anthropic.com/v1/messages'
 
+const corsHeaders = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 serve(async (req) => {
-  // Allow manual trigger via POST (from the UI's "Run now" button)
-  // or scheduled trigger (no auth check needed — service role)
-  const corsHeaders = {
-    'Access-Control-Allow-Origin':  '*',
-    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  }
-
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
@@ -44,40 +39,29 @@ serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
     )
 
-    // ── 1. Get GCC config ────────────────────────────────────────────────────
-    // Parse gcc_id from request body (if manually triggered) or process all
     let gccId: string | null = null
     let debug = false
     try {
       const body = await req.json()
-      gccId = body?.gcc_id ?? null
-      debug = body?.debug === true
-    } catch { /* no body is fine */ }
+      gccId  = body?.gcc_id ?? null
+      debug  = body?.debug === true
+    } catch { /* no body fine */ }
 
-    // ── DEBUG MODE: test Gmail connection and return raw response ─────────────
+    // ── DEBUG: raw Gmail check ────────────────────────────────────────────────
     if (debug) {
-      const accessToken = await getGmailAccessToken()
-      const afterDate   = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
-      const query       = `after:${afterDate}`
-      const url         = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=10`
-      const res         = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } })
-      const data        = await res.json()
-
-      // Also fetch labels to confirm auth scope
-      const labelsRes  = await fetch(`${GMAIL_API}/labels`, { headers: { Authorization: `Bearer ${accessToken}` } })
-      const labelsData = await labelsRes.json()
-
-      return new Response(JSON.stringify({
-        debug:        true,
-        gmail_query:  query,
-        messages:     data,
-        labels_count: labelsData.labels?.length ?? 'error',
-        labels_error: labelsData.error ?? null,
-      }, null, 2), {
+      const token     = await getGmailAccessToken()
+      const afterDate = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+      const res       = await fetch(
+        `${GMAIL_API}/messages?q=${encodeURIComponent(`after:${afterDate}`)}&maxResults=10`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      const data = await res.json()
+      return new Response(JSON.stringify({ debug: true, messages: data }, null, 2), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
 
+    // ── Fetch GCCs ────────────────────────────────────────────────────────────
     const { data: gccs, error: gccErr } = await supabase
       .from('gcc')
       .select('id, name')
@@ -88,10 +72,8 @@ serve(async (req) => {
     }
 
     const results = []
-
     for (const gcc of gccs) {
-      const result = await processGcc(supabase, gcc)
-      results.push(result)
+      results.push(await processGcc(supabase, gcc))
     }
 
     return new Response(JSON.stringify({ ok: true, results }), {
@@ -112,61 +94,43 @@ serve(async (req) => {
 async function processGcc(supabase: any, gcc: { id: string; name: string }) {
   console.log(`Processing GCC: ${gcc.name}`)
 
-  // 1. Refresh Gmail token
   const accessToken = await getGmailAccessToken()
 
-  // 2. Get sync state
-  const { data: syncState } = await supabase
-    .from('email_sync_state')
-    .select('last_history_id, last_synced_at')
-    .eq('gcc_id', gcc.id)
-    .single()
-
-  // 3. Fetch emails (max 50 per run)
-  const messages = await fetchGmailMessages(accessToken, syncState?.last_synced_at)
-  console.log(`Found ${messages.length} emails to process`)
-
-  // Always update sync state so next run uses a fresh cutoff
-  await supabase
-    .from('email_sync_state')
-    .upsert({
-      gcc_id:         gcc.id,
-      last_synced_at: new Date().toISOString(),
-      last_error:     null,
-    }, { onConflict: 'gcc_id' })
+  // Fetch emails — always last 7 days, dedup via email_inbox table
+  const messages = await fetchGmailMessages(accessToken)
+  console.log(`Gmail returned ${messages.length} messages`)
 
   if (!messages.length) {
-    return { gcc: gcc.name, processed: 0, groups_updated: 0 }
+    return { gcc: gcc.name, processed: 0, activities_created: 0, activities_updated: 0 }
   }
 
-  // 4. Load vendors for this GCC (for Claude to match against)
+  // Load vendors for Claude to match against
   const { data: vendors } = await supabase
     .from('vendors')
     .select('id, display_name, firm_name, short_code, category')
     .eq('gcc_id', gcc.id)
     .eq('is_active', true)
 
-  // 5. Check already-processed gmail IDs
-  const { data: processed } = await supabase
+  // Filter out already-processed emails
+  const { data: done } = await supabase
     .from('email_inbox')
     .select('gmail_id')
     .eq('gcc_id', gcc.id)
     .in('gmail_id', messages.map((m: any) => m.id))
 
-  const alreadyProcessed = new Set((processed || []).map((r: any) => r.gmail_id))
-  const newMessages = messages.filter((m: any) => !alreadyProcessed.has(m.id))
-
+  const doneSet     = new Set((done || []).map((r: any) => r.gmail_id))
+  const newMessages = messages.filter((m: any) => !doneSet.has(m.id))
   console.log(`${newMessages.length} new emails to process`)
 
-  let groupsUpdated = 0
+  let created = 0
+  let updated = 0
 
   for (const msg of newMessages) {
     try {
-      // Get full email
       const email = await fetchFullEmail(accessToken, msg.id)
       if (!email) continue
 
-      // Store raw email
+      // Store raw email (audit trail)
       await supabase.from('email_inbox').upsert({
         gmail_id:     email.gmail_id,
         gcc_id:       gcc.id,
@@ -178,40 +142,119 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
         processed:    false,
       }, { onConflict: 'gmail_id' })
 
-      // Call Claude to parse
+      // Claude extracts operational intelligence
       const parsed = await parseEmailWithClaude(email, vendors || [])
+
       if (!parsed || !parsed.is_operational) {
-        console.log(`  Skipping non-operational email: ${email.subject}`)
+        console.log(`  Skipped (non-operational): ${email.subject}`)
+        await supabase.from('email_inbox').update({ processed: true }).eq('gmail_id', email.gmail_id)
         continue
       }
 
-      console.log(`  Parsed: ${parsed.category} | vendor: ${parsed.vendor_id} | urgency: ${parsed.urgency}`)
+      if (!parsed.vendor_id) {
+        // Operational but no vendor matched → send to Icebox for human assignment
+        console.log(`  → Icebox (no vendor match): ${parsed.category} | "${email.subject}"`)
+        await supabase.from('email_activity_groups').insert({
+          gcc_id:             gcc.id,
+          vendor_id:          null,
+          category:           parsed.category,
+          urgency:            parsed.urgency,
+          suggested_deadline: parsed.deadline || null,
+          updates: [{
+            gmail_id:    email.gmail_id,
+            summary:     parsed.summary,
+            received_at: email.received_at,
+            from_name:   email.from_name,
+            from_email:  email.from_email,
+            subject:     email.subject,
+          }],
+          source_gmail_ids: [email.gmail_id],
+          status: 'pending',
+        })
+        await supabase.from('email_inbox').update({ processed: true }).eq('gmail_id', email.gmail_id)
+        continue
+      }
 
-      // Upsert into activity group
-      await upsertActivityGroup(supabase, gcc.id, email, parsed)
+      console.log(`  Operational: "${parsed.category}" | vendor: ${parsed.vendor_id} | urgency: ${parsed.urgency}`)
 
-      // Mark as processed
-      await supabase
-        .from('email_inbox')
-        .update({ processed: true, vendor_id: parsed.vendor_id || null })
-        .eq('gmail_id', email.gmail_id)
+      // Auto-create or update activity — no user review needed
+      const action = await upsertActivity(supabase, gcc.id, email, parsed)
+      if (action === 'created') created++
+      if (action === 'updated') updated++
 
-      groupsUpdated++
-    } catch (emailErr) {
-      console.error(`  Error processing email ${msg.id}:`, emailErr)
+      await supabase.from('email_inbox').update({
+        processed: true,
+        vendor_id: parsed.vendor_id,
+      }).eq('gmail_id', email.gmail_id)
+
+    } catch (err) {
+      console.error(`  Error on ${msg.id}:`, err)
     }
   }
 
-  return { gcc: gcc.name, processed: newMessages.length, groups_updated: groupsUpdated }
+  console.log(`Done: ${created} created, ${updated} updated`)
+  return { gcc: gcc.name, processed: newMessages.length, activities_created: created, activities_updated: updated }
 }
 
-// ── Gmail: get access token from refresh token ────────────────────────────────
+// ── Auto-create or update an activity from an email ──────────────────────────
+
+async function upsertActivity(supabase: any, gccId: string, email: any, parsed: any) {
+  const dateStr  = new Date(email.received_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+  const newEntry = `[${dateStr}] ${parsed.summary}`
+
+  // Look for an existing open activity with same vendor + category
+  const { data: existing } = await supabase
+    .from('activities')
+    .select('id, note, deadline')
+    .eq('vendor_id', parsed.vendor_id)
+    .eq('source', 'email')
+    .ilike('title', parsed.category)
+    .not('status', 'eq', 'closed')
+    .maybeSingle()
+
+  if (existing) {
+    // Append new email summary to existing activity note
+    const note = existing.note ? `${existing.note}\n\n${newEntry}` : newEntry
+
+    // Take the sooner deadline
+    const deadline = parsed.deadline && (!existing.deadline || parsed.deadline < existing.deadline)
+      ? parsed.deadline
+      : existing.deadline
+
+    await supabase
+      .from('activities')
+      .update({ note, deadline, updated_at: new Date().toISOString() })
+      .eq('id', existing.id)
+
+    return 'updated'
+  }
+
+  // Create fresh activity
+  const priority = parsed.urgency === 'critical' ? 'critical'
+    : parsed.urgency === 'high'     ? 'high'
+    : parsed.urgency === 'medium'   ? 'medium'
+    : 'low'
+
+  await supabase.from('activities').insert({
+    vendor_id: parsed.vendor_id,
+    title:     parsed.category,
+    status:    'open',
+    source:    'email',
+    priority,
+    deadline:  parsed.deadline || null,
+    note:      newEntry,
+  })
+
+  return 'created'
+}
+
+// ── Gmail: get access token ───────────────────────────────────────────────────
 
 async function getGmailAccessToken(): Promise<string> {
   const res = await fetch(GMAIL_TOKEN_URL, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
+    body:    new URLSearchParams({
       client_id:     Deno.env.get('GMAIL_CLIENT_ID')!,
       client_secret: Deno.env.get('GMAIL_CLIENT_SECRET')!,
       refresh_token: Deno.env.get('GMAIL_REFRESH_TOKEN')!,
@@ -223,76 +266,59 @@ async function getGmailAccessToken(): Promise<string> {
   return data.access_token
 }
 
-// ── Gmail: list recent unread messages ────────────────────────────────────────
+// ── Gmail: list messages (last 7 days, all mail) ──────────────────────────────
 
-async function fetchGmailMessages(token: string, _since?: string | null): Promise<any[]> {
-  // Always query the last 7 days. DB deduplication via gmail_id prevents reprocessing.
-  // Using last_synced_at as a cutoff caused missed emails when the cutoff was too recent.
+async function fetchGmailMessages(token: string): Promise<any[]> {
   const afterDate = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
   const query     = `after:${afterDate}`
   const url       = `${GMAIL_API}/messages?q=${encodeURIComponent(query)}&maxResults=50`
 
   console.log(`Gmail query: "${query}"`)
-
   const res  = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
   const data = await res.json()
   console.log(`Gmail found: ${data.messages?.length ?? 0} messages`)
   return data.messages || []
 }
 
-// ── Gmail: get full email content ─────────────────────────────────────────────
+// ── Gmail: fetch full email content ──────────────────────────────────────────
 
 async function fetchFullEmail(token: string, msgId: string) {
-  const res  = await fetch(`${GMAIL_API}/messages/${msgId}?format=full`, {
+  const res = await fetch(`${GMAIL_API}/messages/${msgId}?format=full`, {
     headers: { Authorization: `Bearer ${token}` },
   })
-  const msg  = await res.json()
+  const msg = await res.json()
   if (msg.error) return null
 
   const headers  = msg.payload?.headers || []
   const getH     = (name: string) => headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || ''
-
   const from     = getH('From')
-  const fromMatch = from.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/)
-  const fromName  = fromMatch?.[1]?.trim() || ''
-  const fromEmail = fromMatch?.[2]?.trim() || from
-
-  const body = extractBody(msg.payload)
+  const match    = from.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/)
 
   return {
     gmail_id:    msgId,
     subject:     getH('Subject'),
-    from_email:  fromEmail,
-    from_name:   fromName,
+    from_email:  match?.[2]?.trim() || from,
+    from_name:   match?.[1]?.trim() || '',
     received_at: new Date(parseInt(msg.internalDate)).toISOString(),
-    body:        body.slice(0, 2000),  // cap at 2k chars for Claude
+    body:        extractBody(msg.payload).slice(0, 2000),
   }
 }
 
-// Extract plain text body from Gmail payload
 function extractBody(payload: any): string {
   if (!payload) return ''
-
-  // Direct body
-  if (payload.body?.data) {
-    return atob(payload.body.data.replace(/-/g, '+').replace(/_/g, '/'))
-  }
-
-  // Multipart: prefer text/plain
+  if (payload.body?.data) return atob(payload.body.data.replace(/-/g, '+').replace(/_/g, '/'))
   if (payload.parts) {
     for (const part of payload.parts) {
       if (part.mimeType === 'text/plain' && part.body?.data) {
         return atob(part.body.data.replace(/-/g, '+').replace(/_/g, '/'))
       }
     }
-    // Fallback: recurse into first part
     return extractBody(payload.parts[0])
   }
-
   return ''
 }
 
-// ── Claude: parse email and extract operational intelligence ──────────────────
+// ── Claude: extract operational intelligence from email ───────────────────────
 
 async function parseEmailWithClaude(email: any, vendors: any[]): Promise<any> {
   const vendorList = vendors.map(v =>
@@ -303,8 +329,8 @@ async function parseEmailWithClaude(email: any, vendors: any[]): Promise<any> {
 
 Analyze this email and extract operational information.
 
-KNOWN VENDORS for this GCC:
-${vendorList || '(none yet)'}
+KNOWN VENDORS:
+${vendorList || '(none configured)'}
 
 EMAIL:
 From: ${email.from_name} <${email.from_email}>
@@ -313,28 +339,25 @@ Received: ${email.received_at}
 Body:
 ${email.body}
 
-INSTRUCTIONS:
-1. Determine if this is operationally relevant (vendor communication, compliance deadline, facility issue, payroll, legal matter, regulatory filing, etc.)
-2. If relevant, identify which vendor this is from (match to the known vendors list by name, email domain, or context). Use the vendor's UUID from the list.
-3. Determine the CATEGORY — a short 2-5 word operational topic that groups related emails (e.g., "GST Filing", "Payroll Processing", "Office Lease Renewal", "PF Compliance", "TDS Return", "Shop Establishment License")
-4. Write a single clear sentence summarizing what THIS email is saying (not the topic in general — what's new or what action is needed NOW)
-5. Extract any specific deadline date (YYYY-MM-DD format only)
-6. Assess urgency: low (informational) | medium (action needed within 30 days) | high (action needed within 14 days) | critical (immediate action / overdue)
-
-IMPORTANT:
-- If this is spam, newsletter, internal HR chatter, or clearly non-operational, return is_operational: false
-- Category must be consistent — similar emails about the same topic MUST use the exact same category string so they get grouped together
-- Be conservative: only mark as operational if you're confident
+TASK:
+1. Is this email operationally relevant? (vendor communication, compliance deadline, payroll, legal, regulatory, facility, recruitment, etc.)
+   - NOT operational: marketing, newsletters, promotions, OTPs, account notifications, social media
+2. Which vendor sent or relates to this email? Match by sender name, email domain, firm name, or context.
+   - Only match if reasonably confident. Do not guess.
+3. Category: a short 2-5 word operational topic that groups similar emails (e.g. "GST Filing", "Payroll Processing", "Office Lease Renewal", "PF Compliance", "TDS Return", "BGV Checks")
+   - Use consistent category names so related emails cluster into one activity
+4. Summary: one clear sentence about what THIS email says or requires
+5. Deadline: specific date in YYYY-MM-DD format, or null
+6. Urgency: low | medium | high | critical
 
 Return ONLY valid JSON:
 {
   "is_operational": true,
-  "vendor_id": "<uuid from vendors list or null if not matched>",
-  "category": "<2-5 word category>",
-  "summary": "<one clear sentence about what this email says>",
+  "vendor_id": "<uuid or null>",
+  "category": "<2-5 word topic>",
+  "summary": "<one sentence>",
   "deadline": "<YYYY-MM-DD or null>",
-  "urgency": "<low|medium|high|critical>",
-  "action_required": true
+  "urgency": "<low|medium|high|critical>"
 }
 
 Or if not operational:
@@ -349,89 +372,20 @@ Or if not operational:
     },
     body: JSON.stringify({
       model:      'claude-haiku-4-5-20251001',
-      max_tokens: 512,
+      max_tokens: 300,
       messages:   [{ role: 'user', content: prompt }],
     }),
   })
 
   const data = await res.json()
   const text = data.content?.[0]?.text?.trim() || ''
+  console.log(`  Claude response: ${text.slice(0, 200)}`)
 
   try {
-    // Extract JSON from response (Claude sometimes wraps it in backticks)
-    const jsonMatch = text.match(/\{[\s\S]*\}/)
-    return jsonMatch ? JSON.parse(jsonMatch[0]) : null
+    const match = text.match(/\{[\s\S]*\}/)
+    return match ? JSON.parse(match[0]) : null
   } catch {
-    console.error('Failed to parse Claude response:', text)
+    console.error('  Failed to parse Claude JSON:', text)
     return null
-  }
-}
-
-// ── Upsert activity group (deduplicate by vendor + category) ─────────────────
-
-async function upsertActivityGroup(
-  supabase: any,
-  gccId: string,
-  email: any,
-  parsed: any,
-) {
-  // Look for existing pending group with same vendor + category
-  const { data: existing } = await supabase
-    .from('email_activity_groups')
-    .select('id, updates, source_gmail_ids, urgency, suggested_deadline')
-    .eq('gcc_id', gccId)
-    .eq('category', parsed.category)
-    .eq('status', 'pending')
-    .match(parsed.vendor_id ? { vendor_id: parsed.vendor_id } : {})
-    .maybeSingle()
-
-  const newUpdate = {
-    gmail_id:    email.gmail_id,
-    summary:     parsed.summary,
-    received_at: email.received_at,
-    from_name:   email.from_name,
-    from_email:  email.from_email,
-    subject:     email.subject,
-  }
-
-  if (existing) {
-    // Check if this gmail_id is already in the group (no duplicates)
-    const alreadyIn = (existing.source_gmail_ids || []).includes(email.gmail_id)
-    if (alreadyIn) return
-
-    // Append update, escalate urgency if needed
-    const urgencyLevel = { low: 0, medium: 1, high: 2, critical: 3 }
-    const newUrgency   = urgencyLevel[parsed.urgency as keyof typeof urgencyLevel] >
-                         urgencyLevel[existing.urgency as keyof typeof urgencyLevel]
-                           ? parsed.urgency
-                           : existing.urgency
-
-    const newDeadline = parsed.deadline && (!existing.suggested_deadline || parsed.deadline < existing.suggested_deadline)
-      ? parsed.deadline
-      : existing.suggested_deadline
-
-    await supabase
-      .from('email_activity_groups')
-      .update({
-        updates:           [...(existing.updates || []), newUpdate],
-        source_gmail_ids:  [...(existing.source_gmail_ids || []), email.gmail_id],
-        urgency:           newUrgency,
-        suggested_deadline: newDeadline,
-        updated_at:        new Date().toISOString(),
-      })
-      .eq('id', existing.id)
-
-  } else {
-    // Create new group
-    await supabase.from('email_activity_groups').insert({
-      gcc_id:             gccId,
-      vendor_id:          parsed.vendor_id || null,
-      category:           parsed.category,
-      urgency:            parsed.urgency,
-      suggested_deadline: parsed.deadline || null,
-      updates:            [newUpdate],
-      source_gmail_ids:   [email.gmail_id],
-      status:             'pending',
-    })
   }
 }
