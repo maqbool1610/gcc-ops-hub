@@ -6,7 +6,14 @@
 //  2. Fetch emails from the last 7 days (dedup via email_inbox table)
 //  3. For each new email → Claude extracts operational intelligence
 //  4. If operational + vendor matched → auto-create or update activity
-//     No user review required. Email is the source of truth.
+//     Threading: Gmail thread ID first, Claude topic inference second.
+//     Activity gains a structured timeline entry (from, subject, date, summary).
+//  5. If operational + no vendor → Icebox for human assignment
+//  6. If not operational → silent skip
+//
+// email_inbox stores: gmail_id, gmail_thread_id, from, subject, date (no body).
+// activities.timeline stores: structured per-email entries for display.
+// activities.note is human-editable only — not touched by automation.
 //
 // Secrets required:
 //   GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
@@ -45,7 +52,7 @@ serve(async (req) => {
       const body = await req.json()
       gccId  = body?.gcc_id ?? null
       debug  = body?.debug === true
-    } catch { /* no body fine */ }
+    } catch { /* no body is fine */ }
 
     // ── DEBUG: raw Gmail check ────────────────────────────────────────────────
     if (debug) {
@@ -96,7 +103,7 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
 
   const accessToken = await getGmailAccessToken()
 
-  // Fetch emails — always last 7 days, dedup via email_inbox table
+  // Always last 7 days — DB dedup handles reprocessing
   const messages = await fetchGmailMessages(accessToken)
   console.log(`Gmail returned ${messages.length} messages`)
 
@@ -104,14 +111,14 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
     return { gcc: gcc.name, processed: 0, activities_created: 0, activities_updated: 0 }
   }
 
-  // Load vendors for Claude to match against
+  // Load active vendors for Claude to match against
   const { data: vendors } = await supabase
     .from('vendors')
     .select('id, display_name, firm_name, short_code, category')
     .eq('gcc_id', gcc.id)
     .eq('is_active', true)
 
-  // Filter out already-processed emails
+  // Filter out already-processed emails via gmail_id dedup
   const { data: done } = await supabase
     .from('email_inbox')
     .select('gmail_id')
@@ -130,16 +137,16 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
       const email = await fetchFullEmail(accessToken, msg.id)
       if (!email) continue
 
-      // Store raw email (audit trail)
+      // Record in email_inbox for dedup + lightweight audit (no body stored)
       await supabase.from('email_inbox').upsert({
-        gmail_id:     email.gmail_id,
-        gcc_id:       gcc.id,
-        from_email:   email.from_email,
-        from_name:    email.from_name,
-        subject:      email.subject,
-        body_preview: email.body.slice(0, 800),
-        received_at:  email.received_at,
-        processed:    false,
+        gmail_id:        email.gmail_id,
+        gmail_thread_id: email.gmail_thread_id,
+        gcc_id:          gcc.id,
+        from_email:      email.from_email,
+        from_name:       email.from_name,
+        subject:         email.subject,
+        received_at:     email.received_at,
+        processed:       false,
       }, { onConflict: 'gmail_id' })
 
       // Claude extracts operational intelligence
@@ -152,7 +159,8 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
       }
 
       if (!parsed.vendor_id) {
-        // Operational but no vendor matched → send to Icebox for human assignment
+        // Operational but no vendor matched → Icebox for human assignment
+        // Sender/subject stored in the updates JSONB so the Icebox UI can display it
         console.log(`  → Icebox (no vendor match): ${parsed.category} | "${email.subject}"`)
         await supabase.from('email_activity_groups').insert({
           gcc_id:             gcc.id,
@@ -161,12 +169,13 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
           urgency:            parsed.urgency,
           suggested_deadline: parsed.deadline || null,
           updates: [{
-            gmail_id:    email.gmail_id,
-            summary:     parsed.summary,
-            received_at: email.received_at,
-            from_name:   email.from_name,
-            from_email:  email.from_email,
-            subject:     email.subject,
+            gmail_id:        email.gmail_id,
+            gmail_thread_id: email.gmail_thread_id,
+            summary:         parsed.summary,
+            received_at:     email.received_at,
+            from_name:       email.from_name,
+            from_email:      email.from_email,
+            subject:         email.subject,
           }],
           source_gmail_ids: [email.gmail_id],
           status: 'pending',
@@ -177,15 +186,11 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
 
       console.log(`  Operational: "${parsed.category}" | vendor: ${parsed.vendor_id} | urgency: ${parsed.urgency}`)
 
-      // Auto-create or update activity — no user review needed
-      const action = await upsertActivity(supabase, gcc.id, email, parsed)
+      const action = await upsertActivity(supabase, email, parsed)
       if (action === 'created') created++
       if (action === 'updated') updated++
 
-      await supabase.from('email_inbox').update({
-        processed: true,
-        vendor_id: parsed.vendor_id,
-      }).eq('gmail_id', email.gmail_id)
+      await supabase.from('email_inbox').update({ processed: true }).eq('gmail_id', email.gmail_id)
 
     } catch (err) {
       console.error(`  Error on ${msg.id}:`, err)
@@ -196,43 +201,85 @@ async function processGcc(supabase: any, gcc: { id: string; name: string }) {
   return { gcc: gcc.name, processed: newMessages.length, activities_created: created, activities_updated: updated }
 }
 
-// ── Auto-create or update an activity from an email ──────────────────────────
+// ── Find or create an activity and append a timeline entry ────────────────────
+//
+// Threading priority:
+//   1. Gmail thread ID match — catches direct reply chains perfectly
+//   2. Claude topic inference — same vendor + same category label
+//   3. No match — create a fresh activity
 
-async function upsertActivity(supabase: any, gccId: string, email: any, parsed: any) {
-  const dateStr  = new Date(email.received_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
-  const newEntry = `[${dateStr}] ${parsed.summary}`
+async function upsertActivity(supabase: any, email: any, parsed: any) {
+  // Build the structured timeline entry for this email
+  const timelineEntry = {
+    gmail_id:        email.gmail_id,
+    gmail_thread_id: email.gmail_thread_id || null,
+    from_name:       email.from_name,
+    from_email:      email.from_email,
+    subject:         email.subject,
+    received_at:     email.received_at,
+    summary:         parsed.summary,
+  }
 
-  // Look for an existing open activity with same vendor + category
-  const { data: existing } = await supabase
-    .from('activities')
-    .select('id, note, deadline')
-    .eq('vendor_id', parsed.vendor_id)
-    .eq('source', 'email')
-    .ilike('title', parsed.category)
-    .not('status', 'eq', 'closed')
-    .maybeSingle()
+  let existing: any = null
 
+  // ── 1. Thread match ───────────────────────────────────────────────────────
+  // Find any open activity for this vendor whose timeline already has an entry
+  // from the same Gmail thread. This catches reply chains precisely.
+  if (email.gmail_thread_id) {
+    const { data: byThread } = await supabase
+      .from('activities')
+      .select('id, note, deadline, timeline')
+      .eq('vendor_id', parsed.vendor_id)
+      .not('status', 'eq', 'closed')
+      .filter('timeline', 'cs', JSON.stringify([{ gmail_thread_id: email.gmail_thread_id }]))
+      .maybeSingle()
+
+    if (byThread) {
+      existing = byThread
+      console.log(`    → Thread match: activity ${existing.id}`)
+    }
+  }
+
+  // ── 2. Topic inference match ──────────────────────────────────────────────
+  // Same vendor + same category label (case-insensitive) + still open.
+  // Catches related emails that start new threads on the same topic.
+  if (!existing) {
+    const { data: byTopic } = await supabase
+      .from('activities')
+      .select('id, note, deadline, timeline')
+      .eq('vendor_id', parsed.vendor_id)
+      .eq('source', 'email')
+      .ilike('title', parsed.category)
+      .not('status', 'eq', 'closed')
+      .maybeSingle()
+
+    if (byTopic) {
+      existing = byTopic
+      console.log(`    → Topic match: activity ${existing.id}`)
+    }
+  }
+
+  // ── 3. Update existing activity ───────────────────────────────────────────
   if (existing) {
-    // Append new email summary to existing activity note
-    const note = existing.note ? `${existing.note}\n\n${newEntry}` : newEntry
+    const timeline = [...(existing.timeline || []), timelineEntry]
 
-    // Take the sooner deadline
+    // Take the sooner deadline if this email has one
     const deadline = parsed.deadline && (!existing.deadline || parsed.deadline < existing.deadline)
       ? parsed.deadline
       : existing.deadline
 
     await supabase
       .from('activities')
-      .update({ note, deadline, updated_at: new Date().toISOString() })
+      .update({ timeline, deadline, updated_at: new Date().toISOString() })
       .eq('id', existing.id)
 
     return 'updated'
   }
 
-  // Create fresh activity
+  // ── 4. Create fresh activity ──────────────────────────────────────────────
   const priority = parsed.urgency === 'critical' ? 'critical'
-    : parsed.urgency === 'high'     ? 'high'
-    : parsed.urgency === 'medium'   ? 'medium'
+    : parsed.urgency === 'high'   ? 'high'
+    : parsed.urgency === 'medium' ? 'medium'
     : 'low'
 
   await supabase.from('activities').insert({
@@ -242,7 +289,7 @@ async function upsertActivity(supabase: any, gccId: string, email: any, parsed: 
     source:    'email',
     priority,
     deadline:  parsed.deadline || null,
-    note:      newEntry,
+    timeline:  [timelineEntry],
   })
 
   return 'created'
@@ -266,7 +313,7 @@ async function getGmailAccessToken(): Promise<string> {
   return data.access_token
 }
 
-// ── Gmail: list messages (last 7 days, all mail) ──────────────────────────────
+// ── Gmail: list messages (last 7 days) ────────────────────────────────────────
 
 async function fetchGmailMessages(token: string): Promise<any[]> {
   const afterDate = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
@@ -280,7 +327,7 @@ async function fetchGmailMessages(token: string): Promise<any[]> {
   return data.messages || []
 }
 
-// ── Gmail: fetch full email content ──────────────────────────────────────────
+// ── Gmail: fetch a single full message ────────────────────────────────────────
 
 async function fetchFullEmail(token: string, msgId: string) {
   const res = await fetch(`${GMAIL_API}/messages/${msgId}?format=full`, {
@@ -289,18 +336,19 @@ async function fetchFullEmail(token: string, msgId: string) {
   const msg = await res.json()
   if (msg.error) return null
 
-  const headers  = msg.payload?.headers || []
-  const getH     = (name: string) => headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || ''
-  const from     = getH('From')
-  const match    = from.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/)
+  const headers = msg.payload?.headers || []
+  const getH    = (name: string) => headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || ''
+  const from    = getH('From')
+  const match   = from.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/)
 
   return {
-    gmail_id:    msgId,
-    subject:     getH('Subject'),
-    from_email:  match?.[2]?.trim() || from,
-    from_name:   match?.[1]?.trim() || '',
-    received_at: new Date(parseInt(msg.internalDate)).toISOString(),
-    body:        extractBody(msg.payload).slice(0, 2000),
+    gmail_id:        msgId,
+    gmail_thread_id: msg.threadId || null,   // same for all replies in a chain
+    subject:         getH('Subject'),
+    from_email:      match?.[2]?.trim() || from,
+    from_name:       match?.[1]?.trim() || '',
+    received_at:     new Date(parseInt(msg.internalDate)).toISOString(),
+    body:            extractBody(msg.payload).slice(0, 2000),
   }
 }
 
@@ -340,13 +388,17 @@ Body:
 ${email.body}
 
 TASK:
-1. Is this email operationally relevant? (vendor communication, compliance deadline, payroll, legal, regulatory, facility, recruitment, etc.)
+1. Is this email operationally relevant? (vendor communication, compliance deadline, payroll, legal,
+   regulatory, facility, recruitment, etc.)
    - NOT operational: marketing, newsletters, promotions, OTPs, account notifications, social media
-2. Which vendor sent or relates to this email? Match by sender name, email domain, firm name, or context.
-   - Only match if reasonably confident. Do not guess.
-3. Category: a short 2-5 word operational topic that groups similar emails (e.g. "GST Filing", "Payroll Processing", "Office Lease Renewal", "PF Compliance", "TDS Return", "BGV Checks")
-   - Use consistent category names so related emails cluster into one activity
-4. Summary: one clear sentence about what THIS email says or requires
+2. Which vendor does this email relate to? Match by sender name, email domain, firm name, or context.
+   The sender may NOT be the vendor themselves — they could be a government body, regulator, internal
+   team, or third party writing ABOUT a vendor's topic. Match the vendor the email is about, not just
+   who sent it. Only match if reasonably confident. Do not guess.
+3. Category: a short 2-5 word operational topic that groups similar emails
+   (e.g. "GST Filing", "Payroll Processing", "Office Lease Renewal", "PF Compliance", "TDS Return")
+   Use consistent category names so related emails cluster into one activity.
+4. Summary: one clear sentence about what THIS specific email says or requires
 5. Deadline: specific date in YYYY-MM-DD format, or null
 6. Urgency: low | medium | high | critical
 

@@ -184,6 +184,32 @@ export default function ActivityDetail({
           {activity.title}
         </h3>
 
+        {/* ── Email timeline ─────────────────────────────────────────────── */}
+        {activity.source === 'email' && activity.timeline?.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <span style={labelStyle}>Email history · {activity.timeline.length}</span>
+            <div style={{ marginTop: 10, position: 'relative' }}>
+              {/* Vertical connector line */}
+              {activity.timeline.length > 1 && (
+                <div style={{
+                  position:   'absolute',
+                  left:       15,
+                  top:        24,
+                  bottom:     24,
+                  width:      1,
+                  background: 'linear-gradient(180deg, #1c2238 0%, #1c2238 100%)',
+                }} />
+              )}
+              {[...activity.timeline]
+                .sort((a, b) => new Date(a.received_at).getTime() - new Date(b.received_at).getTime())
+                .map((entry, i) => (
+                  <TimelineEntry key={entry.gmail_id || i} entry={entry} vendorColor={vendorColor} />
+                ))
+              }
+            </div>
+          </div>
+        )}
+
         {/* ── Note ──────────────────────────────────────────────────────── */}
         <div style={{ marginBottom: 16 }}>
           <div style={{
@@ -434,6 +460,83 @@ export default function ActivityDetail({
   )
 }
 
+
+// ── TimelineEntry sub-component ──────────────────────────────────────────────
+
+function TimelineEntry({ entry, vendorColor }) {
+  const date = entry.received_at
+    ? new Date(entry.received_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+    : ''
+  const time = entry.received_at
+    ? new Date(entry.received_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
+    : ''
+
+  return (
+    <div style={{ display: 'flex', gap: 10, marginBottom: 10, alignItems: 'flex-start' }}>
+      {/* Dot on the timeline line */}
+      <div style={{ flexShrink: 0, paddingTop: 10 }}>
+        <div style={{
+          width:        8,
+          height:       8,
+          borderRadius: '50%',
+          background:   vendorColor,
+          border:       `2px solid #10131e`,
+          boxShadow:    `0 0 0 1px ${vendorColor}44`,
+          position:     'relative',
+          zIndex:       1,
+        }} />
+      </div>
+
+      {/* Card */}
+      <div style={{
+        flex:         1,
+        background:   '#0d0f1a',
+        border:       '1px solid #1c2238',
+        borderRadius: 10,
+        padding:      '10px 12px',
+        minWidth:     0,
+      }}>
+        {/* From + date row */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, marginBottom: 5 }}>
+          <div style={{ minWidth: 0 }}>
+            <span style={{ color: '#e4e4e7', fontSize: 12, fontWeight: 600 }}>
+              {entry.from_name || entry.from_email}
+            </span>
+            {entry.from_name && entry.from_email && (
+              <span style={{ color: '#3f3f46', fontSize: 11, marginLeft: 5 }}>
+                &lt;{entry.from_email}&gt;
+              </span>
+            )}
+          </div>
+          <div style={{ color: '#3f3f46', fontSize: 10, flexShrink: 0, textAlign: 'right', lineHeight: 1.4 }}>
+            <div>{date}</div>
+            <div>{time}</div>
+          </div>
+        </div>
+
+        {/* Subject */}
+        {entry.subject && (
+          <div style={{
+            color:        '#52525b',
+            fontSize:     11,
+            marginBottom: 6,
+            fontStyle:    'italic',
+            overflow:     'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace:   'nowrap',
+          }}>
+            {entry.subject}
+          </div>
+        )}
+
+        {/* Claude summary */}
+        <div style={{ color: '#a1a1aa', fontSize: 12, lineHeight: 1.55 }}>
+          {entry.summary}
+        </div>
+      </div>
+    </div>
+  )
+}
 
 // ── AuditRow sub-component ───────────────────────────────────────────────────
 

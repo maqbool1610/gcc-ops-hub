@@ -48,9 +48,10 @@ export function useIcebox(gccId) {
     })
     if (error) return { error: error.message }
 
+    // Delete the icebox row — email data doesn't persist after it becomes an activity
     await supabase
       .from('email_activity_groups')
-      .update({ status: 'confirmed', vendor_id: vendorId })
+      .delete()
       .eq('id', item.id)
 
     setItems(prev => prev.filter(i => i.id !== item.id))
@@ -58,9 +59,10 @@ export function useIcebox(gccId) {
   }
 
   async function dismiss(itemId) {
+    // Delete entirely — no need to retain dismissed email data
     await supabase
       .from('email_activity_groups')
-      .update({ status: 'dismissed' })
+      .delete()
       .eq('id', itemId)
     setItems(prev => prev.filter(i => i.id !== itemId))
   }
