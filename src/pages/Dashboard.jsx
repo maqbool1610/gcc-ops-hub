@@ -86,23 +86,6 @@ export default function Dashboard() {
     [vendorActivities, filter]
   )
 
-  const stats = useMemo(() => {
-    const total    = allActivities.length
-    const active   = allActivities.filter(a => a.status !== 'closed').length
-    const flags    = allActivities.filter(a => a.status === 'red_flag').length
-    const today    = new Date()
-    const in14Days = allActivities.filter(a => {
-      if (a.status === 'closed' || !a.deadline) return false
-      const days = Math.ceil((new Date(a.deadline) - today) / 86400000)
-      return days >= 0 && days <= 14
-    }).length
-    const waiting  = allActivities.filter(a => a.status === 'waiting').length
-    const overdue  = allActivities.filter(a =>
-      a.deadline && a.status !== 'closed' && new Date(a.deadline) < today
-    ).length
-    return { total, active, flags, in14Days, waiting, overdue }
-  }, [allActivities])
-
   const vendorStats = useMemo(() => {
     const map = {}
     allActivities.forEach(a => {
@@ -121,50 +104,6 @@ export default function Dashboard() {
     () => allActivities.filter(a => a.blocked_by_id && a.blocked_by?.status !== 'closed' && a.status !== 'closed'),
     [allActivities]
   )
-
-  // Hero operational health card content
-  const health = useMemo(() => {
-    if (stats.flags > 0) return {
-      label:    `${stats.flags} item${stats.flags > 1 ? 's' : ''} flagged`,
-      sub:      'Needs your attention',
-      icon:     '⚑',
-      color:    '#f87171',
-      gradient: 'linear-gradient(135deg, #2a0a0a 0%, #180606 100%)',
-      border:   '#5c1a1a',
-    }
-    if (stats.overdue > 0) return {
-      label:    `${stats.overdue} overdue deadline${stats.overdue > 1 ? 's' : ''}`,
-      sub:      'Past their due date',
-      icon:     '◷',
-      color:    '#fbbf24',
-      gradient: 'linear-gradient(135deg, #1e1508 0%, #120d04 100%)',
-      border:   '#4a3810',
-    }
-    if (stats.in14Days > 0) return {
-      label:    `${stats.in14Days} due within 14 days`,
-      sub:      'Coming up soon',
-      icon:     '◷',
-      color:    '#fbbf24',
-      gradient: 'linear-gradient(135deg, #1a1306 0%, #100c04 100%)',
-      border:   '#3a2e12',
-    }
-    if (stats.active > 0) return {
-      label:    `${stats.active} open items in progress`,
-      sub:      'Operations running',
-      icon:     '◉',
-      color:    '#60a5fa',
-      gradient: 'linear-gradient(135deg, #0c1828 0%, #080f1c 100%)',
-      border:   '#163248',
-    }
-    return {
-      label:    'All calm. Nothing urgent.',
-      sub:      'Operations on track',
-      icon:     '✓',
-      color:    '#34d399',
-      gradient: 'linear-gradient(135deg, #0a1e14 0%, #060e09 100%)',
-      border:   '#133828',
-    }
-  }, [stats])
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   function selectVendor(id) {
@@ -389,36 +328,6 @@ export default function Dashboard() {
                         {profile?.gcc?.company_name || ''} · {new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}
                       </div>
 
-                      {/* Hero health card */}
-                      <div style={{
-                        background:   health.gradient,
-                        border:       `1px solid ${health.border}`,
-                        borderRadius: 18,
-                        padding:      '18px 20px',
-                        marginBottom: 20,
-                        position:     'relative',
-                        overflow:     'hidden',
-                      }}>
-                        {/* Glow orb */}
-                        <div style={{ position: 'absolute', top: -20, right: -20, width: 100, height: 100, borderRadius: '50%', background: health.color + '15', filter: 'blur(24px)', pointerEvents: 'none' }} />
-
-                        <div style={{ color: health.color + '99', fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10 }}>
-                          Operational Status
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-                          <span style={{ fontSize: 20, color: health.color, lineHeight: 1 }}>{health.icon}</span>
-                          <span style={{ color: C.text1, fontSize: 17, fontWeight: 700, letterSpacing: '-0.02em', lineHeight: 1.25 }}>{health.label}</span>
-                        </div>
-                        <div style={{ color: health.color + 'aa', fontSize: 12 }}>{health.sub}</div>
-
-                        {/* Mini stats row */}
-                        <div style={{ display: 'flex', gap: 16, marginTop: 14, paddingTop: 14, borderTop: `1px solid ${health.color}20` }}>
-                          <MiniStat label="Vendors" value={displayedVendors.length} color={health.color} />
-                          <MiniStat label="Active"  value={stats.active}           color={health.color} />
-                          {stats.flags > 0 && <MiniStat label="Flagged" value={stats.flags} color="#f87171" />}
-                        </div>
-                      </div>
-
                       {/* Dependency banner */}
                       {blockedActivities.length > 0 && <DependencyBanner blockedActivities={blockedActivities} />}
 
@@ -549,32 +458,6 @@ export default function Dashboard() {
                   </div>
 
                   {blockedActivities.length > 0 && <DependencyBanner blockedActivities={blockedActivities} />}
-
-                  {/* Hero health card — desktop (horizontal) */}
-                  <div style={{
-                    background:   health.gradient,
-                    border:       `1px solid ${health.border}`,
-                    borderRadius: 16,
-                    padding:      '16px 20px',
-                    marginBottom: 16,
-                    display:      'flex',
-                    alignItems:   'center',
-                    gap:          16,
-                    position:     'relative',
-                    overflow:     'hidden',
-                  }}>
-                    <div style={{ position: 'absolute', top: -20, right: 20, width: 100, height: 100, borderRadius: '50%', background: health.color + '12', filter: 'blur(24px)', pointerEvents: 'none' }} />
-                    <div style={{ fontSize: 24, color: health.color, lineHeight: 1, flexShrink: 0 }}>{health.icon}</div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ color: C.text1, fontSize: 15, fontWeight: 700, letterSpacing: '-0.02em', marginBottom: 3 }}>{health.label}</div>
-                      <div style={{ color: health.color + 'aa', fontSize: 11 }}>{health.sub}</div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 16, flexShrink: 0 }}>
-                      <MiniStat label="Vendors" value={displayedVendors.length} color={health.color} />
-                      <MiniStat label="Active"  value={stats.active}           color={health.color} />
-                      {stats.flags > 0 && <MiniStat label="Flagged" value={stats.flags} color="#f87171" />}
-                    </div>
-                  </div>
 
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                     <span style={{ color: C.text3, fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Vendors</span>
@@ -775,15 +658,6 @@ export default function Dashboard() {
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-
-function MiniStat({ label, value, color }) {
-  return (
-    <div style={{ textAlign: 'center' }}>
-      <div style={{ color, fontSize: 16, fontWeight: 700, lineHeight: 1, letterSpacing: '-0.02em', fontVariantNumeric: 'tabular-nums' }}>{value}</div>
-      <div style={{ color: color + '88', fontSize: 10, marginTop: 2 }}>{label}</div>
-    </div>
-  )
-}
 
 function AddVendorCard({ onClick }) {
   return (
