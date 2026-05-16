@@ -14,12 +14,19 @@ export function AuthProvider({ children }) {
   // ── Fetch profile row ──────────────────────────────────────────────────────
   async function fetchProfile(userId) {
     try {
-      const { data, error } = await supabase
+      // Race the DB query against a 5s timeout — prevents infinite loading
+      // if Supabase is slow or the session is stale
+      const query   = supabase
         .from('users')
         .select('*, gcc:gcc_id (id, name, company_name, city)')
         .eq('id', userId)
         .single()
 
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('profile_timeout')), 5000)
+      )
+
+      const { data, error } = await Promise.race([query, timeout])
       setProfile(error ? null : data)
     } catch {
       setProfile(null)
@@ -36,16 +43,14 @@ export function AuthProvider({ children }) {
 
   // ── Auth listener ──────────────────────────────────────────────────────────
   useEffect(() => {
-    // Safety net — never leave the app stuck on "Loading…" forever
-    const timeout = setTimeout(() => {
-      setLoading(false)
-    }, 6000)
+    // Hard safety net — fires unconditionally after 8s no matter what.
+    // NOT cancelled by the auth event, so even if fetchProfile or
+    // refreshSession hangs, the app always unblocks.
+    const safety = setTimeout(() => setLoading(false), 8000)
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
-        clearTimeout(timeout)
-
-        // No session → go to login
+        // No session → go to login immediately
         if (!session) {
           setSession(null)
           setProfile(null)
@@ -54,7 +59,7 @@ export function AuthProvider({ children }) {
         }
 
         // On first load: check if JWT has our custom claims.
-        // If not, the token was issued before the auth hook — refresh it now.
+        // If not, the token predates the auth hook — refresh it once.
         if (event === 'INITIAL_SESSION' && !refreshingRef.current) {
           const payload = decodeJwt(session.access_token)
           if (payload && !payload.user_role) {
@@ -63,29 +68,28 @@ export function AuthProvider({ children }) {
             refreshingRef.current = false
 
             if (error || !data?.session) {
-              // Can't get a valid session — force sign-out
+              // Invalid session — clear everything and go to login
               setSession(null)
               setProfile(null)
               setLoading(false)
-              supabase.auth.signOut()
+              await supabase.auth.signOut()
               return
             }
 
-            // Use the refreshed session directly (don't wait for TOKEN_REFRESHED event)
             setSession(data.session)
             await fetchProfile(data.session.user.id)
             return
           }
         }
 
-        // Normal path: set session + load profile
+        // Normal path
         setSession(session)
         await fetchProfile(session.user.id)
       }
     )
 
     return () => {
-      clearTimeout(timeout)
+      clearTimeout(safety)
       subscription.unsubscribe()
     }
   }, [])
